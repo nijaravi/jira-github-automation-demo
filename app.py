@@ -2,14 +2,16 @@
 Demo login module.
 
 Intentionally partial for the pipeline demo against SCRUM-2:
-  - Input validation: real format/length checks now added (SCRUM-2 requirement 1)
-  - Rate limiting: NOT implemented (missing on purpose)
-  - Unit tests: NOT included (missing on purpose)
+  - Input validation: real format/length checks (SCRUM-2 requirement 1)
+  - Rate limiting: fixed-window limiter on failed attempts (SCRUM-2 requirement 2)
+  - Unit tests: cover input validation only, not rate limiting (partial on requirement 3)
   - Contains one deliberate vulnerability for Semgrep to catch: SQL query built via
     string formatting (SQL injection), plus a hardcoded secret key
 """
 
 import re
+import time
+from collections import defaultdict
 
 from flask import Flask, request, jsonify
 import sqlite3
@@ -20,6 +22,32 @@ app = Flask(__name__)
 app.secret_key = "super-secret-key-12345"
 
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{3,32}$")
+
+MAX_ATTEMPTS = 5
+WINDOW_SECONDS = 300
+
+# In-memory rate-limit store: username -> list of failed-attempt timestamps.
+# Demo-scale only; a real deployment would use a shared store like Redis.
+_failed_attempts = defaultdict(list)
+
+
+def is_valid_username(username):
+    return bool(username) and bool(USERNAME_RE.match(username))
+
+
+def is_valid_password(password):
+    return bool(password) and 8 <= len(password) <= 128
+
+
+def is_rate_limited(username):
+    now = time.time()
+    attempts = [t for t in _failed_attempts[username] if now - t < WINDOW_SECONDS]
+    _failed_attempts[username] = attempts
+    return len(attempts) >= MAX_ATTEMPTS
+
+
+def record_failed_attempt(username):
+    _failed_attempts[username].append(time.time())
 
 
 def get_db():
@@ -35,10 +63,14 @@ def login():
     # Real input validation: presence, length, and character-set checks
     if not username or not password:
         return jsonify({"error": "username and password are required"}), 400
-    if not USERNAME_RE.match(username):
+    if not is_valid_username(username):
         return jsonify({"error": "username must be 3-32 alphanumeric/underscore characters"}), 400
-    if len(password) < 8 or len(password) > 128:
+    if not is_valid_password(password):
         return jsonify({"error": "password must be 8-128 characters"}), 400
+
+    # Rate limiting: block repeated failed attempts for a given username
+    if is_rate_limited(username):
+        return jsonify({"error": "too many failed attempts, try again later"}), 429
 
     # Deliberate vuln #2: SQL injection via string formatting instead of parameterized query
     conn = get_db()
@@ -50,11 +82,12 @@ def login():
 
     if user:
         return jsonify({"status": "ok", "user": username})
+    record_failed_attempt(username)
     return jsonify({"error": "invalid credentials"}), 401
 
 
-# No rate limiting on this route — repeated failed attempts are not throttled.
-# No unit tests included in this commit.
+# Unit tests (test_app.py) cover input validation only — rate limiting is
+# not yet under test.
 
 if __name__ == "__main__":
     app.run(debug=True)
